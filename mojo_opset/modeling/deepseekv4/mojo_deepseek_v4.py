@@ -1,11 +1,14 @@
 import math
 import json
 import os
+import logging
 from typing import Optional, Tuple
 
 import torch
+import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from mojo_opset import MojoGemm
 from mojo_opset import MojoQuantGemm
@@ -738,7 +741,7 @@ class DeepseekV4Attention(nn.Module):
 
             if self.indexer is not None:
                 cmp_sparse_indices = self.indexer.forward(
-                    hidden_states, qa, cmp_cos, cmp_sin,
+                    hidden_states, qa, cos, sin,
                     past_key_values=past_key_values, layer_idx=self.layer_idx,
                 )
 
@@ -854,7 +857,7 @@ class DeepseekV4SharedExpert(nn.Module):
 
 class DeepseekV4MoE(nn.Module):
 
-    def __init__(self, config: DeepseekV4Config, layer_idx: int):
+    def __init__(self, config: DeepseekV4Config, layer_idx: int, ep_size: int = 1, ep_rank: int = 0):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -867,9 +870,16 @@ class DeepseekV4MoE(nn.Module):
         self.topk_method = config.topk_method
         self.is_hash = layer_idx < config.num_hash_layers
 
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.experts_per_rank = self.n_routed_experts // self.ep_size
+        self.ep_start = self.ep_rank * self.experts_per_rank
+        self.ep_end = self.ep_start + self.experts_per_rank
+        self.ep_group = None
+
         self.dispatch = MojoMoEDispatch(num_experts=config.n_routed_experts)
         self.experts = MojoQuantExperts(
-            num_experts=config.n_routed_experts,
+            num_experts=self.experts_per_rank,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             weight_dtype=torch.int8,
@@ -938,7 +948,8 @@ class DeepseekV4MoE(nn.Module):
         topk_weight = topk_weight * self.routed_scaling_factor
         return topk_idx.to(torch.int32), topk_weight
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None,
+                is_prefill: bool = True) -> torch.Tensor:
         residuals = hidden_states
         orig_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, self.hidden_size).to(torch.bfloat16)
@@ -946,15 +957,97 @@ class DeepseekV4MoE(nn.Module):
         logits = F.linear(hidden_states_flat.float(), self.gate)
         topk_idx, topk_weight = self._gate_topk(logits, input_ids)
 
+        if self.ep_size > 1 and self.ep_group is not None and not is_prefill:
+            routed_out = self._moe_infer_ep_decode(hidden_states_flat, topk_idx, topk_weight)
+            shared_out = self.shared_experts(residuals)
+            return routed_out.view(*orig_shape) + shared_out
+
         sorted_hidden, tokens_per_expert, sorted_gates, token_indices = self.dispatch(
             hidden_states_flat, topk_weight, topk_idx
         )
-        expert_outputs = self.experts(sorted_hidden, tokens_per_expert)
-        output_buffer = torch.zeros_like(hidden_states_flat, memory_format=torch.contiguous_format)
-        routed_out = self.combine(output_buffer, expert_outputs, sorted_gates, token_indices)
+
+        if self.ep_size > 1 and self.ep_group is not None:
+            routed_out = self._moe_infer_ep(
+                hidden_states_flat, sorted_hidden, tokens_per_expert, sorted_gates, token_indices)
+        else:
+            expert_outputs = self.experts(sorted_hidden, tokens_per_expert)
+            output_buffer = torch.zeros_like(hidden_states_flat, memory_format=torch.contiguous_format)
+            routed_out = self.combine(output_buffer, expert_outputs, sorted_gates, token_indices)
 
         shared_out = self.shared_experts(residuals)
         return routed_out.view(*orig_shape) + shared_out
+
+    def _moe_infer_ep(self, hidden_states_flat, sorted_hidden, tokens_per_expert,
+                      sorted_gates, token_indices):
+        moe_ep_group = self.ep_group
+        rank = dist.get_rank()
+
+        logging.info(f"[EP] rank={rank}, layer={self.layer_idx}, tokens_per_expert.sum={tokens_per_expert.sum().item()}, sorted_hidden.shape={sorted_hidden.shape}")
+
+        tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
+        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
+
+        combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+        combine_tokens = combine_tokens.view(2, self.ep_size, -1).sum(2)
+        all_tokens = combine_tokens[0].sum()
+        combine_tokens_cpu = combine_tokens.cpu().tolist()
+        input_splits = combine_tokens_cpu[1]
+        output_splits = combine_tokens_cpu[0]
+
+        logging.info(f"[EP] rank={rank}, layer={self.layer_idx}, input_splits={input_splits}, output_splits={output_splits}, all_tokens={all_tokens.item()}")
+
+        gathered_tokens = sorted_hidden.new_empty(all_tokens.item(), sorted_hidden.shape[1])
+        dist.all_to_all_single(gathered_tokens, sorted_hidden, output_splits, input_splits, group=moe_ep_group)
+
+        local_tokens_per_expert = tokens_per_expert_group.view(self.ep_size, self.experts_per_rank).sum(0)
+
+        logging.info(f"[EP] rank={rank}, layer={self.layer_idx}, gathered_tokens.shape={gathered_tokens.shape}, local_tokens_per_expert.sum={local_tokens_per_expert.sum().item()}")
+
+        expert_outputs = self.experts(gathered_tokens, local_tokens_per_expert)
+
+        combined_tokens = expert_outputs.new_empty(sorted_hidden.shape[0], expert_outputs.shape[1])
+        dist.all_to_all_single(combined_tokens, expert_outputs, input_splits, output_splits, group=moe_ep_group)
+
+        output_buffer = torch.zeros_like(hidden_states_flat, memory_format=torch.contiguous_format)
+        routed_out = self.combine(output_buffer, combined_tokens, sorted_gates, token_indices)
+
+        logging.info(f"[EP] rank={rank}, layer={self.layer_idx}, done")
+        return routed_out
+
+    def _moe_infer_ep_decode(self, hidden_states_flat, topk_idx, topk_weight):
+        n_tokens = hidden_states_flat.shape[0]
+        h = hidden_states_flat.shape[1]
+        topk = topk_idx.shape[-1]
+
+        expert_ids_flat = topk_idx.reshape(-1)
+        local_mask = (expert_ids_flat >= self.ep_start) & (expert_ids_flat < self.ep_end)
+        local_expert_ids = expert_ids_flat[local_mask] - self.ep_start
+
+        token_ids = torch.arange(n_tokens, device=hidden_states_flat.device).unsqueeze(1).expand(-1, topk).reshape(-1)
+        local_token_ids = token_ids[local_mask]
+        local_gates = topk_weight.reshape(-1)[local_mask]
+
+        n_local = local_token_ids.shape[0]
+
+        if n_local > 0:
+            tokens_per_local_expert = torch.zeros(self.experts_per_rank, dtype=torch.long, device=hidden_states_flat.device)
+            tokens_per_local_expert.scatter_add_(0, local_expert_ids.long(), torch.ones_like(local_expert_ids, dtype=torch.long))
+            sorted_indices = local_expert_ids.argsort(stable=True)
+            sorted_input = hidden_states_flat[local_token_ids[sorted_indices]]
+            expert_outputs = self.experts(sorted_input, tokens_per_local_expert)
+            expert_outputs = expert_outputs.to(hidden_states_flat.dtype)
+        else:
+            expert_outputs = hidden_states_flat.new_empty(0, h)
+
+        output_buffer = torch.zeros(n_tokens, h, dtype=hidden_states_flat.dtype, device=hidden_states_flat.device)
+        if n_local > 0:
+            gated_outputs = expert_outputs * local_gates[sorted_indices].unsqueeze(1).to(expert_outputs.dtype)
+            unsort_indices = sorted_indices.argsort()
+            idx_for_scatter = local_token_ids[unsort_indices].long().unsqueeze(1).expand(-1, h)
+            output_buffer.scatter_add_(0, idx_for_scatter, gated_outputs[unsort_indices])
+
+        dist.all_reduce(output_buffer)
+        return output_buffer
 
 
 class OpKernel:
@@ -1027,7 +1120,7 @@ class OpKernel:
 
 class DeepseekV4DecoderLayer(nn.Module):
 
-    def __init__(self, config: DeepseekV4Config, layer_idx: int):
+    def __init__(self, config: DeepseekV4Config, layer_idx: int, ep_size: int = 1, ep_rank: int = 0):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -1037,7 +1130,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
         self.self_attn = DeepseekV4Attention(config=config, layer_idx=layer_idx)
-        self.mlp = DeepseekV4MoE(config, layer_idx)
+        self.mlp = DeepseekV4MoE(config, layer_idx, ep_size=ep_size, ep_rank=ep_rank)
 
         hc_dim = self.hc_mult * config.hidden_size
         mix_hc = (2 + self.hc_mult) * self.hc_mult
@@ -1064,6 +1157,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         input_ids: Optional[torch.Tensor] = None,
+        is_prefill: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1087,7 +1181,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.norm_eps, self.hc_eps
         )
         hidden_states = self.ffn_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states, input_ids=input_ids)
+        hidden_states = self.mlp(hidden_states, input_ids=input_ids, is_prefill=is_prefill)
         hidden_states = OpKernel.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states
@@ -1095,14 +1189,16 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 class DeepseekV4Model(nn.Module):
 
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(self, config: DeepseekV4Config, ep_size: int = 1, ep_rank: int = 0):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)
+            DeepseekV4DecoderLayer(config, layer_idx, ep_size=ep_size, ep_rank=ep_rank) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = MojoRMSNorm(eps=config.rms_norm_eps, norm_size=config.hidden_size)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config=config)
@@ -1134,6 +1230,7 @@ class DeepseekV4Model(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[PagedDummyCache] = None,
         use_cache: Optional[bool] = None,
+        is_prefill: bool = True,
         **kwargs,
     ) -> Tuple[torch.Tensor, PagedDummyCache]:
         device = input_ids.device
@@ -1156,7 +1253,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, attention_mask=attention_mask,
                 position_embeddings=position_embeddings, position_ids=position_ids,
                 past_key_values=past_key_values, use_cache=use_cache,
-                input_ids=input_ids, **kwargs,
+                input_ids=input_ids, is_prefill=is_prefill, **kwargs,
             )
 
         hidden_states = self._hc_head(hidden_states)
@@ -1166,7 +1263,7 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(nn.Module):
 
-    def __init__(self, config, num_layers=None):
+    def __init__(self, config, num_layers=None, ep_size=1, ep_rank=0):
         super().__init__()
         if not isinstance(config, DeepseekV4Config):
             config = DeepseekV4Config._from_hf_config(config)
@@ -1187,8 +1284,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             config.num_hidden_layers = num_layers
             config.compress_ratios = config.compress_ratios[:num_layers]
         self.config = config
-        self.model = DeepseekV4Model(config)
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.model = DeepseekV4Model(config, ep_size=ep_size, ep_rank=ep_rank)
         self.lm_head = MojoGemm(in_features=config.hidden_size, out_features=config.vocab_size, bias=False)
+        self.hccl_comm_dict = {}
 
     def forward(
         self,
@@ -1197,16 +1297,42 @@ class DeepseekV4ForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[PagedDummyCache] = None,
         use_cache: Optional[bool] = None,
+        is_prefill: bool = True,
         **kwargs,
     ) -> Tuple[torch.Tensor, PagedDummyCache]:
         hidden_states, past_key_values = self.model(
             input_ids, attention_mask=attention_mask, position_ids=position_ids,
-            past_key_values=past_key_values, use_cache=use_cache, **kwargs,
+            past_key_values=past_key_values, use_cache=use_cache,
+            is_prefill=is_prefill, **kwargs,
         )
         hidden_states_flat = hidden_states.view(-1, self.config.hidden_size).to(torch.bfloat16)
         logits = self.lm_head(hidden_states_flat)
         logits = logits.view(*hidden_states.shape[:-1], self.config.vocab_size)
         return logits, past_key_values
+
+    def init_parallel_comm_group(self):
+        if not dist.is_initialized():
+            logging.warning("dist not initialized, skip init_parallel_comm_group")
+            return
+        world_size = dist.get_world_size()
+        global_rank = dist.get_rank()
+        if self.ep_size > 1:
+            hccl_buffer_size = int(os.environ.get("HCCL_BUFFSIZE", "200"))
+            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+            options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+            moe_ep_group = dist.new_group(
+                ranks=list(range(world_size)),
+                pg_options=options,
+            )
+            self.hccl_comm_dict["moe_ep_group"] = moe_ep_group
+            logging.info(f"Created moe_ep_group: world_size={world_size}, ep_size={self.ep_size}, rank={global_rank}, hccl_buffer_size={hccl_buffer_size}")
+        else:
+            self.hccl_comm_dict["moe_ep_group"] = None
+
+    def set_ep_group(self):
+        moe_ep_group = self.hccl_comm_dict.get("moe_ep_group")
+        for layer in self.model.layers:
+            layer.mlp.ep_group = moe_ep_group
 
     @staticmethod
     def _align_weight(weight, target):
@@ -1257,7 +1383,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         for layer_idx in range(model.config.num_hidden_layers):
             pfx = f"layers.{layer_idx}.ffn.experts"
-            for eid in range(model.config.n_routed_experts):
+            ep_start = model.ep_rank * (model.config.n_routed_experts // model.ep_size)
+            ep_end = ep_start + model.config.n_routed_experts // model.ep_size
+            for eid in range(ep_start, ep_end):
                 for w in ["w1.weight", "w1.scale", "w2.weight", "w2.scale", "w3.weight", "w3.scale"]:
                     needed_checkpoint_keys.add(f"{pfx}.{eid}.{w}")
 
@@ -1360,38 +1488,42 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @staticmethod
     def _load_expert_weights(model, expert_weights):
-        n_experts = model.config.n_routed_experts
+        ep_size = model.ep_size
+        ep_rank = model.ep_rank
+        experts_per_rank = model.config.n_routed_experts // ep_size
+        ep_start = ep_rank * experts_per_rank
         intermediate_size = model.config.moe_intermediate_size
         hidden_size = model.config.hidden_size
 
         for layer_idx in range(model.config.num_hidden_layers):
             experts_mod = model.model.layers[layer_idx].mlp.experts
 
-            up_proj_w = torch.empty(n_experts, intermediate_size * 2, hidden_size, dtype=torch.int8)
-            up_proj_s = torch.empty(n_experts, intermediate_size * 2, dtype=torch.bfloat16)
-            down_proj_w = torch.empty(n_experts, hidden_size, intermediate_size, dtype=torch.int8)
-            down_proj_s = torch.empty(n_experts, hidden_size, dtype=torch.bfloat16)
+            up_proj_w = torch.empty(experts_per_rank, intermediate_size * 2, hidden_size, dtype=torch.int8)
+            up_proj_s = torch.empty(experts_per_rank, intermediate_size * 2, dtype=torch.bfloat16)
+            down_proj_w = torch.empty(experts_per_rank, hidden_size, intermediate_size, dtype=torch.int8)
+            down_proj_s = torch.empty(experts_per_rank, hidden_size, dtype=torch.bfloat16)
 
-            for eid in range(n_experts):
-                w1_key = f"layers.{layer_idx}.ffn.experts.{eid}.w1.weight"
-                w3_key = f"layers.{layer_idx}.ffn.experts.{eid}.w3.weight"
-                w2_key = f"layers.{layer_idx}.ffn.experts.{eid}.w2.weight"
-                s1_key = f"layers.{layer_idx}.ffn.experts.{eid}.w1.scale"
-                s3_key = f"layers.{layer_idx}.ffn.experts.{eid}.w3.scale"
-                s2_key = f"layers.{layer_idx}.ffn.experts.{eid}.w2.scale"
+            for local_eid in range(experts_per_rank):
+                global_eid = ep_start + local_eid
+                w1_key = f"layers.{layer_idx}.ffn.experts.{global_eid}.w1.weight"
+                w3_key = f"layers.{layer_idx}.ffn.experts.{global_eid}.w3.weight"
+                w2_key = f"layers.{layer_idx}.ffn.experts.{global_eid}.w2.weight"
+                s1_key = f"layers.{layer_idx}.ffn.experts.{global_eid}.w1.scale"
+                s3_key = f"layers.{layer_idx}.ffn.experts.{global_eid}.w3.scale"
+                s2_key = f"layers.{layer_idx}.ffn.experts.{global_eid}.w2.scale"
 
                 if w1_key in expert_weights:
-                    up_proj_w[eid, :intermediate_size, :] = expert_weights[w1_key]
+                    up_proj_w[local_eid, :intermediate_size, :] = expert_weights[w1_key]
                 if w3_key in expert_weights:
-                    up_proj_w[eid, intermediate_size:, :] = expert_weights[w3_key]
+                    up_proj_w[local_eid, intermediate_size:, :] = expert_weights[w3_key]
                 if w2_key in expert_weights:
-                    down_proj_w[eid] = expert_weights[w2_key]
+                    down_proj_w[local_eid] = expert_weights[w2_key]
                 if s1_key in expert_weights:
-                    up_proj_s[eid, :intermediate_size] = expert_weights[s1_key].squeeze(-1).to(torch.bfloat16)
+                    up_proj_s[local_eid, :intermediate_size] = expert_weights[s1_key].squeeze(-1).to(torch.bfloat16)
                 if s3_key in expert_weights:
-                    up_proj_s[eid, intermediate_size:] = expert_weights[s3_key].squeeze(-1).to(torch.bfloat16)
+                    up_proj_s[local_eid, intermediate_size:] = expert_weights[s3_key].squeeze(-1).to(torch.bfloat16)
                 if s2_key in expert_weights:
-                    down_proj_s[eid] = expert_weights[s2_key].squeeze(-1).to(torch.bfloat16)
+                    down_proj_s[local_eid] = expert_weights[s2_key].squeeze(-1).to(torch.bfloat16)
 
             experts_mod.up_proj_weight.copy_(up_proj_w)
             experts_mod.up_proj_weight_scale.data.copy_(up_proj_s)

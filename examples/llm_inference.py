@@ -2,8 +2,11 @@ import argparse
 import importlib
 import json
 import os
+import logging
 
 import torch
+import torch_npu
+import torch.distributed as dist
 
 from transformers import AutoTokenizer
 
@@ -15,6 +18,12 @@ ARCH_MAP = {
     "SeedOssForCausalLM": ("mojo_opset.modeling.seed_oss.mojo_seed_oss_base", "SeedOssForCausalLM"),
     "DeepseekV4ForCausalLM": ("mojo_opset.modeling.deepseekv4.mojo_deepseek_v4", "DeepseekV4ForCausalLM"),
 }
+
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - [LLM](%(filename)s:%(lineno)d): %(message)s',
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
 def resolve_model_class(model_path: str):
@@ -36,19 +45,63 @@ def resolve_model_class(model_path: str):
     return getattr(module, cls_name)
 
 
-def generate(model, tokenizer, prompt, max_new_tokens, device):
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        input_ids = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
-        ).to(device)
-    except (TypeError, NotImplementedError, ValueError):
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+def init_distributed(ep_size):
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    rank_offset = int(os.getenv("RANK_OFFSET", "0"))
+    global_rank = local_rank + rank_offset
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
 
-    print(f"\nPrompt: {prompt}")
-    print("-" * 40)
+    npu_device_idx = int(os.getenv("NPU_DEVICE_IDX", local_rank))
+    torch.npu.set_device(torch.device(f"npu:{npu_device_idx}"))
+
+    if world_size > 1:
+        if not dist.is_initialized():
+            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+            dist.init_process_group(
+                backend="hccl",
+                world_size=world_size,
+                rank=global_rank,
+                pg_options=options,
+            )
+            logger.info(f"HCCL init done: global_rank={global_rank}, world_size={world_size}, local_rank={local_rank}")
+    return local_rank, global_rank, world_size
+
+
+def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1):
+    if dist.is_initialized():
+        global_rank = dist.get_rank()
+    else:
+        global_rank = 0
+
+    is_main = (global_rank == 0)
+
+    if is_main:
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            input_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
+            )
+        except (TypeError, NotImplementedError, ValueError):
+            input_ids = tokenizer.encode(prompt, return_tensors="pt")
+
+        input_ids = input_ids.to(device)
+        seq_len = torch.tensor([input_ids.shape[1]], dtype=torch.int64, device=device)
+    else:
+        input_ids = torch.zeros(1, 1, dtype=torch.long, device=device)
+        seq_len = torch.tensor([0], dtype=torch.int64, device=device)
+
+    if ep_size > 1 and dist.is_initialized():
+        dist.broadcast(seq_len, src=0)
+        if not is_main:
+            input_ids = torch.zeros(1, seq_len.item(), dtype=torch.long, device=device)
+        dist.broadcast(input_ids, src=0)
+
+    if is_main:
+        print(f"\nPrompt: {prompt}")
+        print("-" * 40)
+
     with torch.no_grad():
-        outputs = model(input_ids, use_cache=True)
+        outputs = model(input_ids, use_cache=True, is_prefill=True)
         if hasattr(outputs, "logits"):
             logits = outputs.logits
             past_key_values = outputs.past_key_values
@@ -58,12 +111,15 @@ def generate(model, tokenizer, prompt, max_new_tokens, device):
     next_token_logits = logits[:, -1, :]
     next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
 
+    if ep_size > 1 and dist.is_initialized():
+        dist.broadcast(next_token_id, src=0)
+
     generated_ids = [next_token_id.item()]
     input_ids = next_token_id
 
     for step in range(max_new_tokens - 1):
         with torch.no_grad():
-            outputs = model(input_ids, past_key_values=past_key_values, use_cache=True)
+            outputs = model(input_ids, past_key_values=past_key_values, use_cache=True, is_prefill=False)
             if hasattr(outputs, "logits"):
                 logits = outputs.logits
                 past_key_values = outputs.past_key_values
@@ -72,22 +128,28 @@ def generate(model, tokenizer, prompt, max_new_tokens, device):
 
         next_token_logits = logits[:, -1, :]
         next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+
+        if ep_size > 1 and dist.is_initialized():
+            dist.broadcast(next_token_id, src=0)
+
         tid = next_token_id.item()
         generated_ids.append(tid)
         input_ids = next_token_id
 
         if tid == tokenizer.eos_token_id:
-            print(f"EOS reached at step {step}.")
+            if is_main:
+                print(f"EOS reached at step {step}.")
             break
 
-    print("-" * 40)
-    print(f"Generated token IDs: {generated_ids}")
-    for tid in generated_ids:
-        raw = tokenizer.decode([tid])
-        clean = tokenizer.decode([tid], skip_special_tokens=True)
-        print(f"  token {tid}: raw={repr(raw)}, clean={repr(clean)}")
-    full_output = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    print(f"Generated text: {full_output}")
+    if is_main:
+        print("-" * 40)
+        print(f"Generated token IDs: {generated_ids}")
+        for tid in generated_ids:
+            raw = tokenizer.decode([tid])
+            clean = tokenizer.decode([tid], skip_special_tokens=True)
+            print(f"  token {tid}: raw={repr(raw)}, clean={repr(clean)}")
+        full_output = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        print(f"Generated text: {full_output}")
 
 
 def parse_args():
@@ -98,6 +160,7 @@ def parse_args():
     parser.add_argument("--prompt", type=str, default="今天天气怎么样？")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--transformers", action="store_true", help="Use Transformers model")
+    parser.add_argument("--ep_size", type=int, default=int(os.getenv("EP_SIZE", "1")))
     return parser.parse_args()
 
 
@@ -106,6 +169,9 @@ def main():
 
     if not args.model_path and not os.getenv("QWEN3_MODEL_PATH"):
         raise ValueError("Please pass --model_path or set QWEN3_MODEL_PATH")
+
+    ep_size = args.ep_size
+    local_rank, global_rank, world_size = init_distributed(ep_size)
 
     local_files_only = _resolve_local_files_only(args.model_path)
 
@@ -136,14 +202,23 @@ def main():
             from mojo_opset.modeling.deepseekv4.mojo_deepseek_v4 import DeepseekV4Config
             hf_config = DeepseekV4Config(**cfg_dict)
 
+        ep_rank = global_rank % ep_size if ep_size > 1 else 0
+
+        npu_device_idx = int(os.getenv("NPU_DEVICE_IDX", local_rank))
+
         if hasattr(model_class, "load_weights"):
             from transformers.modeling_utils import no_init_weights
             origin_dtype = torch.get_default_dtype()
             torch.set_default_dtype(torch.bfloat16)
             with no_init_weights():
-                model = model_class(hf_config, num_layers=args.num_layers)
+                model = model_class(hf_config, num_layers=args.num_layers, ep_size=ep_size, ep_rank=ep_rank)
             torch.set_default_dtype(origin_dtype)
-            model = model.to(args.device).eval()
+            model = model.to(f"npu:{npu_device_idx}").eval()
+
+            if ep_size > 1 and dist.is_initialized():
+                model.init_parallel_comm_group()
+                model.set_ep_group()
+
             model_class.load_weights(model, args.model_path)
         else:
             model = build_model_from_hf(
@@ -164,7 +239,11 @@ def main():
     if tokenizer is None:
         raise ValueError("Tokenizer not found")
 
-    generate(model, tokenizer, args.prompt, args.max_new_tokens, args.device)
+    npu_device_idx = int(os.getenv("NPU_DEVICE_IDX", "0"))
+    generate(model, tokenizer, args.prompt, args.max_new_tokens, f"npu:{npu_device_idx}", ep_size=ep_size)
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
