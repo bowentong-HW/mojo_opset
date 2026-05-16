@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch_npu
+import custom_ops
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -14,127 +15,50 @@ from mojo_opset import MojoGemm
 from mojo_opset import MojoQuantGemm
 from mojo_opset import MojoRMSNorm
 from mojo_opset import MojoDynamicQuant
-from mojo_opset import MojoStorePagedKVCache
 from mojo_opset import MojoMoEDispatch
 from mojo_opset import MojoQuantExperts
 from mojo_opset import MojoMoECombine
 
-
-_HAS_INPLACE_PARTIAL_ROTARY = hasattr(torch.ops.custom, "inplace_partial_rotary_mul")
-_HAS_NPU_SPARSE_ATTN_SHAREDKV = hasattr(torch.ops.custom, "npu_sparse_attn_sharedkv")
-_HAS_NPU_HC_PRE = hasattr(torch.ops.custom, "npu_hc_pre")
-_HAS_NPU_HC_POST = hasattr(torch.ops.custom, "npu_hc_post")
-_HAS_COMPRESSOR = hasattr(torch.ops.custom, "compressor")
-_HAS_QUANT_LIGHTNING_INDEXER = hasattr(torch.ops.custom, "npu_quant_lightning_indexer")
-_HAS_NPU_MOE_GATING_TOP_K = hasattr(torch.ops.custom, "npu_moe_gating_top_k")
-
-
-def _fallback_partial_rotary(x, cos, sin, partial_slice):
-    if isinstance(partial_slice, list):
-        rope_dim_start = partial_slice[0]
-        rope_dim_end = partial_slice[1]
-    else:
-        rope_dim_start = x.shape[-1] - partial_slice
-        rope_dim_end = x.shape[-1]
-
-    head_dim = x.shape[-1]
-    rope_dim = rope_dim_end - rope_dim_start
-    half_rope = rope_dim // 2
-
-    x1 = x[..., :rope_dim_start]
-    x2 = x[..., rope_dim_start:rope_dim_end]
-    x3 = x[..., rope_dim_end:]
-
-    while cos.dim() < x2.dim():
-        cos = cos.unsqueeze(-2)
-    while sin.dim() < x2.dim():
-        sin = sin.unsqueeze(-2)
-
-    cos_slice = cos[..., :half_rope]
-    sin_slice = sin[..., :half_rope]
-
-    x2_even = x2[..., 0::2]
-    x2_odd = x2[..., 1::2]
-    rotated_even = x2_even * cos_slice - x2_odd * sin_slice
-    rotated_odd = x2_even * sin_slice + x2_odd * cos_slice
-
-    rotated = torch.stack([rotated_even, rotated_odd], dim=-1).flatten(-2)
-    parts = [x1, rotated]
-    if x3.numel() > 0 and x3.shape[-1] > 0:
-        parts.append(x3)
-    return torch.cat(parts, dim=-1)
-
-
 def _apply_partial_rotary(x, cos, sin, partial_slice):
-    if _HAS_INPLACE_PARTIAL_ROTARY:
-        try:
-            torch.ops.custom.inplace_partial_rotary_mul(
-                x, cos, sin,
-                rotary_mode="interleave",
-                partial_slice=partial_slice,
-            )
-            return x
-        except RuntimeError:
-            pass
-    return _fallback_partial_rotary(x, cos, sin, partial_slice)
-
-
-def _fallback_sparse_attn_sharedkv(q, kv_cache, block_tables, seq_lens, scaling, attn_sink=None,
-                                    cmp_kv_cache=None, cmp_block_tables=None, compress_ratio=1,
-                                    cmp_sparse_indices=None):
-    head_dim = q.shape[-1]
-    num_heads = q.shape[-2] if q.dim() >= 2 else 1
-    batch_size = seq_lens.shape[0]
-    is_tnd = q.dim() == 3
-
-    all_outputs = []
-    token_offset = 0
-    for b in range(batch_size):
-        slen = int(seq_lens[b].item())
-
-        if is_tnd:
-            q_len = max(1, q.shape[0] // batch_size)
-        else:
-            q_len = 1
-
-        if slen <= 0:
-            all_outputs.append(torch.zeros(q_len, num_heads, head_dim, device=q.device, dtype=q.dtype))
-            if is_tnd:
-                token_offset += q_len
-            continue
-
-        if block_tables.dim() == 2:
-            kv_blocks = block_tables[b]
-            valid_blocks = kv_blocks[kv_blocks >= 0]
-            if valid_blocks.numel() > 0:
-                k_all = kv_cache[valid_blocks]
-                if k_all.dim() == 4 and k_all.shape[2] == 1:
-                    k_all = k_all.squeeze(2)
-                k_all = k_all.reshape(-1, head_dim)[:slen]
-            else:
-                k_all = torch.zeros(slen, head_dim, device=q.device, dtype=kv_cache.dtype)
-        else:
-            k_all = kv_cache.view(-1, head_dim)[:slen]
-
-        if is_tnd:
-            q_b = q[token_offset:token_offset + q_len]
-            token_offset += q_len
-        else:
-            q_b = q[b:b + 1]
-
-        k_b = k_all.unsqueeze(0).unsqueeze(0).expand(q_len, num_heads, -1, -1)
-        v_b = k_b.clone()
-
-        scores = torch.matmul(q_b.float().unsqueeze(2), k_b.transpose(-2, -1).float()) * scaling
-
-        if attn_sink is not None:
-            scores[:, :, :, :1] = scores[:, :, :, :1] + attn_sink.view(1, num_heads, 1, 1).float()
-
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_out = torch.matmul(attn_weights, v_b.float()).squeeze(2)
-        all_outputs.append(attn_out.to(q.dtype))
-
-    return torch.cat(all_outputs, dim=0)
+    if isinstance(partial_slice, list):
+        rope_dim = partial_slice[1] - partial_slice[0]
+    else:
+        rope_dim = partial_slice
+    orig_shape = x.shape
+    if x.dim() == 4:
+        b, s, h, d = x.shape
+        x_4d = x.reshape(b * s * h, 1, 1, d)
+    elif x.dim() == 3:
+        b, s, d = x.shape
+        x_4d = x.reshape(b * s, 1, 1, d)
+    else:
+        x_4d = x.unsqueeze(-3).unsqueeze(-3)
+    if cos.dim() == 3:
+        cos = cos.reshape(-1, 1, 1, rope_dim)
+    elif cos.dim() == 2:
+        cos = cos.unsqueeze(-2).unsqueeze(-2)
+    if sin.dim() == 3:
+        sin = sin.reshape(-1, 1, 1, rope_dim)
+    elif sin.dim() == 2:
+        sin = sin.unsqueeze(-2).unsqueeze(-2)
+    if x.dim() == 4 and x_4d.shape[0] != cos.shape[0]:
+        repeat_factor = x_4d.shape[0] // cos.shape[0]
+        cos = cos.repeat(repeat_factor, 1, 1, 1)
+        sin = sin.repeat(repeat_factor, 1, 1, 1)
+    torch.ops.custom.inplace_partial_rotary_mul(
+        x_4d, cos, sin,
+        rotary_mode="interleave",
+        partial_slice=partial_slice,
+    )
+    if x_4d.shape != orig_shape:
+        if len(orig_shape) == 4:
+            b, s, h, d = orig_shape
+            x_4d = x_4d.reshape(b, s, h, d)
+        elif len(orig_shape) == 3:
+            b, s, d = orig_shape
+            x_4d = x_4d.reshape(b, s, d)
+        return x_4d
+    return x
 
 
 class DeepseekV4Config:
@@ -246,7 +170,7 @@ class PagedDummyCache:
         total_blocks = self.batch_size * max_blocks_per_seq * self.num_layers
 
         self.kv_cache = torch.zeros(
-            (total_blocks, 1, self.block_size, self.head_dim),
+            (total_blocks, self.block_size, 1, self.head_dim),
             dtype=torch.bfloat16, device=self.device,
         )
         self.block_tables = torch.full(
@@ -258,7 +182,6 @@ class PagedDummyCache:
         )
         self.free_blocks = torch.arange(total_blocks, device=self.device, dtype=torch.int32)
         self.num_free_blocks = total_blocks
-        self.store_paged_kv = MojoStorePagedKVCache()
 
         self.cache_data = {}
         for layer_idx in range(self.num_layers):
@@ -270,6 +193,7 @@ class PagedDummyCache:
                 "li_cmp_kv": None,
                 "li_kv_state": None,
                 "li_key_dequant_scale": None,
+                "c4a_cmp_kv_block_table": None,
             }
             win_block_num = self._get_block_num(self.sliding_window)
             cache_dict["win_kv"] = self._create_cache(win_block_num, self.head_dim, torch.bfloat16)
@@ -280,8 +204,14 @@ class PagedDummyCache:
                 state_block_num = self._get_block_num((1 + overlap_num) * ratio)
                 cache_dict["sfa_cmp_kv"] = self._create_cache(cmp_block_num, self.head_dim, torch.bfloat16)
                 cache_dict["sfa_kv_state"] = self._create_state_cache(state_block_num, ratio, self.head_dim)
-                cache_dict["li_cmp_kv"] = self._create_cache(cmp_block_num, self.index_head_dim, torch.bfloat16)
+                cache_dict["li_cmp_kv"] = self._create_cache(cmp_block_num, self.index_head_dim, torch.int8)
                 cache_dict["li_kv_state"] = self._create_state_cache(state_block_num, ratio, self.index_head_dim)
+                cache_dict["li_key_dequant_scale"] = self._create_cache(cmp_block_num, 1, torch.float16)
+                cmp_block_num_per_batch = (cmp_block_num - 1) // self.batch_size
+                cache_dict["c4a_cmp_kv_block_table"] = (
+                    torch.arange(0, self.batch_size * cmp_block_num_per_batch, dtype=torch.int32, device=self.device)
+                    .view(self.batch_size, -1) + 1
+                )
             elif ratio == 128:
                 cmp_block_num = self._get_block_num(max_seq_len // ratio)
                 overlap_num = 1
@@ -335,11 +265,28 @@ class PagedDummyCache:
                 newly_allocated = self._allocate_blocks(num_to_allocate)
                 self.block_tables[layer_idx, i, old_num_blocks:new_num_blocks] = newly_allocated
 
-        kv_flat = kv.reshape(-1, 1, self.head_dim)
-        self.store_paged_kv(
-            kv_flat, kv_flat, self.kv_cache, self.kv_cache,
-            self.block_tables[layer_idx], cu_q_lens, current_seq_lens,
-        )
+        kv_flat = kv.reshape(-1, self.head_dim)
+        slot_mapping = torch.full((kv_flat.shape[0],), -1, dtype=torch.int32, device=kv.device)
+        for b in range(batch_size):
+            context_len = current_seq_lens[b].item()
+            q_start = cu_q_lens[b].item()
+            q_end = cu_q_lens[b + 1].item()
+            q_len = q_end - q_start
+            for t in range(q_len):
+                pos = context_len + t
+                block_idx = pos // self.block_size
+                offset = pos % self.block_size
+                if block_idx < self.block_tables.shape[2]:
+                    phys_block = self.block_tables[layer_idx, b, block_idx].item()
+                    if phys_block >= 0:
+                        slot_mapping[q_start + t] = phys_block * self.block_size + offset
+
+        valid_mask = slot_mapping >= 0
+        if valid_mask.any():
+            cache_flat = self.kv_cache.view(-1, self.head_dim)
+            torch.ops.custom.scatter_nd_update_asc(
+                cache_flat, slot_mapping[valid_mask].reshape(-1, 1), kv_flat[valid_mask]
+            )
         self.seq_lens[layer_idx] += new_seq_len
 
     def update_win_kv(self, kv: torch.Tensor, layer_idx: int, slot_mapping: Optional[torch.Tensor] = None) -> None:
@@ -350,8 +297,7 @@ class PagedDummyCache:
         kv_flat = kv.reshape(-1, self.head_dim)
         win_flat = win_cache.view(-1, self.head_dim)
         if slot_mapping is not None:
-            sm = slot_mapping.reshape(-1, 1).expand(-1, self.head_dim)
-            win_flat.scatter_(0, sm, kv_flat)
+            torch.ops.custom.scatter_nd_update_asc(win_flat, slot_mapping.reshape(-1, 1), kv_flat)
         else:
             context_len = int(self.seq_lens[layer_idx][0].item())
             for t in range(seq_len):
@@ -369,8 +315,7 @@ class PagedDummyCache:
         kv_flat = kv.reshape(-1, self.head_dim)
         cmp_flat = sfa_cmp_cache.view(-1, self.head_dim)
         if slot_mapping is not None:
-            sm = slot_mapping.reshape(-1, 1).expand(-1, self.head_dim)
-            cmp_flat.scatter_(0, sm, kv_flat)
+            torch.ops.custom.scatter_nd_update_asc(cmp_flat, slot_mapping.reshape(-1, 1), kv_flat)
         else:
             ratio = self.config.compress_ratios[layer_idx]
             cmp_context_len = int(self.seq_lens[layer_idx][0].item()) // ratio
@@ -383,14 +328,18 @@ class PagedDummyCache:
 
     def update_li_cmp_kv(self, kv: torch.Tensor, layer_idx: int, slot_mapping: Optional[torch.Tensor] = None) -> None:
         li_cmp_cache = self.cache_data[layer_idx]["li_cmp_kv"]
+        scale_cache = self.cache_data[layer_idx]["li_key_dequant_scale"]
         if li_cmp_cache is None:
             return
         batch_size, seq_len, _ = kv.shape
         kv_flat = kv.reshape(-1, self.index_head_dim)
+        kv_quant, k_scale = torch_npu.npu_dynamic_quant(kv_flat)
+        k_scale = k_scale.to(torch.float16)
         cmp_flat = li_cmp_cache.view(-1, self.index_head_dim)
+        scale_flat = scale_cache.view(-1, 1)
         if slot_mapping is not None:
-            sm = slot_mapping.reshape(-1, 1).expand(-1, self.index_head_dim)
-            cmp_flat.scatter_(0, sm, kv_flat)
+            torch.ops.custom.scatter_nd_update_asc(cmp_flat, slot_mapping.reshape(-1, 1), kv_quant)
+            torch.ops.custom.scatter_nd_update_asc(scale_flat, slot_mapping.reshape(-1, 1), k_scale.unsqueeze(-1))
         else:
             ratio = self.config.compress_ratios[layer_idx]
             cmp_context_len = int(self.seq_lens[layer_idx][0].item()) // ratio
@@ -399,7 +348,8 @@ class PagedDummyCache:
                 block_idx = pos // self.block_size + 1
                 offset = pos % self.block_size
                 if block_idx < li_cmp_cache.shape[0]:
-                    li_cmp_cache[block_idx, offset, 0, :] = kv_flat[t]
+                    li_cmp_cache[block_idx, offset, 0, :] = kv_quant[t]
+                    scale_cache[block_idx, offset, 0, 0] = k_scale[t]
 
     def get_kv_for_decode(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         max_slen = self.seq_lens[layer_idx].max().item()
@@ -423,6 +373,9 @@ class PagedDummyCache:
 
     def get_li_key_dequant_scale(self, layer_idx: int):
         return self.cache_data[layer_idx]["li_key_dequant_scale"]
+
+    def get_c4a_cmp_kv_block_table(self, layer_idx: int):
+        return self.cache_data[layer_idx]["c4a_cmp_kv_block_table"]
 
     def get_cmp_kv_for_decode(self, layer_idx: int):
         sfa_cmp = self.cache_data[layer_idx]["sfa_cmp_kv"]
@@ -604,45 +557,52 @@ class DeepseekV4Indexer(nn.Module):
         q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
         q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
 
-        if _HAS_QUANT_LIGHTNING_INDEXER and past_key_values is not None:
-            try:
-                import torch_npu
-                li_cmp_kv = past_key_values.get_li_cmp_kv(layer_idx)
+        if past_key_values is not None:
+            li_cmp_kv = past_key_values.get_li_cmp_kv(layer_idx)
+            li_key_dequant_scale = past_key_values.get_li_key_dequant_scale(layer_idx)
+            c4a_block_table = past_key_values.get_c4a_cmp_kv_block_table(layer_idx)
 
-                q_flat = q.flatten(0, 1)
-                q_quant, q_scale = torch_npu.npu_dynamic_quant(q_flat)
-                q_scale = q_scale.to(torch.float16)
+            q_flat = q.flatten(0, 1)
+            q_quant, q_scale = torch_npu.npu_dynamic_quant(q_flat)
+            q_scale = q_scale.to(torch.float16)
 
-                actual_seq_q = cu_seqlens_q[1:] if cu_seqlens_q is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
-                actual_seq_k = seq_lens if seq_lens is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
+            actual_seq_q = cu_seqlens_q[1:] if cu_seqlens_q is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
+            actual_seq_k = seq_lens if seq_lens is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
 
-                topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(
-                    query=q_quant, key=li_cmp_kv, weights=weights.flatten(0, 1).to(torch.float16),
-                    query_dequant_scale=q_scale,
-                    key_dequant_scale=torch.ones(1, dtype=torch.float16, device=x.device),
-                    actual_seq_lengths_query=actual_seq_q,
-                    actual_seq_lengths_key=actual_seq_k,
-                    block_table=None, layout_key='PA_BSND',
-                    sparse_count=self.index_topk, sparse_mode=3,
-                    layout_query="TND", cmp_ratio=self.compress_ratio,
-                    key_quant_mode=0, query_quant_mode=0,
-                )
-                return topk_idxs.view(q_flat.shape[0], -1, self.index_topk)
-            except RuntimeError:
-                pass
+            li_metadata = torch.ops.custom.npu_quant_lightning_indexer_metadata(
+                layout_key='PA_BSND',
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+                layout_query="TND",
+                cmp_ratio=self.compress_ratio,
+                key_quant_mode=0,
+                query_quant_mode=0,
+                num_heads_q=self.n_heads,
+                num_heads_k=1,
+                head_dim=self.head_dim,
+                actual_seq_lengths_query=actual_seq_q,
+                actual_seq_lengths_key=actual_seq_k,
+            )
 
-        return self._fallback_indexer(q, li_kv, weights, batch_size, seq_len)
+            topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(
+                query=q_quant, key=li_cmp_kv, weights=weights.flatten(0, 1).to(torch.float16),
+                query_dequant_scale=q_scale,
+                key_dequant_scale=li_key_dequant_scale.squeeze(-2),
+                actual_seq_lengths_query=actual_seq_q,
+                actual_seq_lengths_key=actual_seq_k,
+                block_table=c4a_block_table, layout_key='PA_BSND',
+                sparse_count=self.index_topk, sparse_mode=3,
+                layout_query="TND", cmp_ratio=self.compress_ratio,
+                key_quant_mode=0, query_quant_mode=0,
+                metadata=li_metadata,
+            )
+            return topk_idxs.view(q_flat.shape[0], -1, self.index_topk)
 
-    def _fallback_indexer(self, q, li_cmp_kv, weights, batch_size, seq_len):
         return None
 
 
 def _dynamic_quant_per_token(x: torch.Tensor):
-    x_fp = x.float()
-    scale = x_fp.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 127
-    scale = torch.where(scale < 1e-6, 1.0, scale)
-    output = torch.clamp(torch.round(x_fp / scale), -128, 127)
-    return output.to(torch.int8), scale.squeeze(-1)
+    return torch_npu.npu_dynamic_quant(x)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -756,29 +716,42 @@ class DeepseekV4Attention(nn.Module):
     def _run_attn(self, q, kv_cache, block_tables, seq_lens, batch_size, seq_length,
                   compress_ratio, cu_q_lens=None, cmp_kv_cache=None, cmp_block_tables=None,
                   cmp_sparse_indices=None):
-        if _HAS_NPU_SPARSE_ATTN_SHAREDKV:
-            try:
-                o = torch.ops.custom.npu_sparse_attn_sharedkv(
-                    q=q, ori_kv=kv_cache,
-                    cmp_kv=cmp_kv_cache if cmp_kv_cache is not None else kv_cache,
-                    cmp_sparse_indices=cmp_sparse_indices,
-                    cu_seqlens_q=cu_q_lens, seqused_kv=seq_lens,
-                    cmp_block_table=cmp_block_tables if cmp_block_tables is not None and compress_ratio > 1 else None,
-                    ori_block_table=block_tables, cmp_ratio=compress_ratio,
-                    ori_mask_mode=4, cmp_mask_mode=3,
-                    ori_win_left=self.sliding_window - 1, ori_win_right=0,
-                    layout_q="TND", layout_kv="PA_ND",
-                    sinks=self.attn_sink, metadata=None,
-                    softmax_scale=self.scaling,
-                )[0]
-                return o.view(batch_size, seq_length, self.num_heads, self.head_dim)
-            except RuntimeError:
-                pass
-        o = _fallback_sparse_attn_sharedkv(
-            q, kv_cache, block_tables, seq_lens, self.scaling, self.attn_sink,
-            cmp_kv_cache=cmp_kv_cache, cmp_block_tables=cmp_block_tables,
-            compress_ratio=compress_ratio, cmp_sparse_indices=cmp_sparse_indices,
-        )
+        has_cmp_kv = compress_ratio > 1
+        metadata_kwargs = {
+            "cu_seqlens_q": cu_q_lens,
+            "seqused_kv": seq_lens,
+            "batch_size": batch_size,
+            "cmp_ratio": compress_ratio,
+            "ori_mask_mode": 4,
+            "cmp_mask_mode": 3,
+            "ori_win_left": self.sliding_window - 1,
+            "ori_win_right": 0,
+            "layout_q": "TND",
+            "layout_kv": "PA_ND",
+            "num_heads_q": self.num_heads,
+            "num_heads_kv": 1,
+            "head_dim": self.head_dim,
+            "has_ori_kv": True,
+            "has_cmp_kv": has_cmp_kv,
+        }
+        if has_cmp_kv and compress_ratio == 4:
+            metadata_kwargs["cmp_topk"] = self.config.index_topk
+
+        metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**metadata_kwargs)
+
+        o = torch.ops.custom.npu_sparse_attn_sharedkv(
+            q=q, ori_kv=kv_cache,
+            cmp_kv=cmp_kv_cache if has_cmp_kv else None,
+            cmp_sparse_indices=cmp_sparse_indices if has_cmp_kv else None,
+            cu_seqlens_q=cu_q_lens, seqused_kv=seq_lens,
+            cmp_block_table=cmp_block_tables if has_cmp_kv and cmp_block_tables is not None else None,
+            ori_block_table=block_tables, cmp_ratio=compress_ratio,
+            ori_mask_mode=4, cmp_mask_mode=3,
+            ori_win_left=self.sliding_window - 1, ori_win_right=0,
+            layout_q="TND", layout_kv="PA_ND",
+            sinks=self.attn_sink, metadata=metadata,
+            softmax_scale=self.scaling,
+        )[0]
         return o.view(batch_size, seq_length, self.num_heads, self.head_dim)
 
     def _c1a_attention(self, q, kv, past_key_values, context_lens):
@@ -842,16 +815,41 @@ class DeepseekV4SharedExpert(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         x_flat = x.reshape(-1, self.hidden_size).to(torch.bfloat16)
-        x_gate, gate_scale = self.gate_quant(x_flat)
-        x_up, up_scale = self.up_quant(x_flat)
-        gate_out = self.gate_proj(x_gate, gate_scale)
-        up_out = self.up_proj(x_up, up_scale)
-        gate_act = F.silu(gate_out.float())
-        intermediate = gate_act * up_out.float()
+        x_quant, activation_scale = self.gate_quant(x_flat)
+
+        gate_up_weight = torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0).transpose(0, 1).contiguous()
+        gate_up_weight_scale = torch.cat(
+            (self.gate_proj.weight_scale, self.up_proj.weight_scale), dim=0
+        ).contiguous()
+        merged_x = torch_npu.npu_quant_matmul(
+            x_quant,
+            gate_up_weight,
+            gate_up_weight_scale.view(-1).float(),
+            pertoken_scale=None,
+            bias=None,
+            output_dtype=torch.int32,
+        )
+
+        swiglu_limit_args = {}
         if self.swiglu_limit is not None and self.swiglu_limit > 0:
-            intermediate = intermediate.clamp(-self.swiglu_limit, self.swiglu_limit)
-        intermediate = intermediate.to(torch.bfloat16)
-        intermediate_quant, intermediate_scale = self.intermediate_quant(intermediate)
+            swiglu_limit_args.update(
+                {
+                    "swiglu_mode": 1,
+                    "clamp_limit": self.swiglu_limit,
+                    "glu_alpha": 1,
+                    "glu_bias": 0,
+                }
+            )
+        intermediate_quant, intermediate_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
+            merged_x,
+            weight_scale=gate_up_weight_scale.view(-1).float(),
+            quant_scale=self.intermediate_quant.inv_smooth_scale.to(dtype=torch.float32),
+            quant_mode=1,
+            activate_left=True,
+            activation_scale=activation_scale.view(-1),
+            **swiglu_limit_args,
+        )
+        intermediate_scale = intermediate_scale.unsqueeze(-1)
         return self.down_proj(intermediate_quant, intermediate_scale).view(*orig_shape)
 
 
@@ -930,30 +928,17 @@ class DeepseekV4MoE(nn.Module):
             raise NotImplementedError(f"Unsupported scoring_func: {self.scoring_func}")
 
         if self.topk_method == "noaux_tc":
-            if _HAS_NPU_MOE_GATING_TOP_K:
-                scoring_func_mapping = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}
-                try:
-                    topk_weight, topk_idx, _ = torch.ops.custom.npu_moe_gating_top_k(
-                        logits, k=self.top_k, bias=self.e_score_correction_bias,
-                        input_ids=input_ids if self.is_hash else None,
-                        tid2eid=self.tid2eid, k_group=1, group_count=1,
-                        group_select_mode=1, renorm=0,
-                        norm_type=scoring_func_mapping[self.scoring_func],
-                        routed_scaling_factor=self.routed_scaling_factor,
-                        eps=float(1e-20), out_flag=False,
-                    )
-                    return topk_idx.to(torch.int32), topk_weight
-                except RuntimeError:
-                    pass
-
-            if not self.is_hash:
-                tmp_scores = scores + self.e_score_correction_bias.unsqueeze(0)
-                _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
-            else:
-                hash_idx = self.tid2eid[input_ids]
-                topk_idx = hash_idx.view(scores.shape[0], -1)
-
-            topk_weight = scores.gather(1, topk_idx)
+            scoring_func_mapping = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}
+            topk_weight, topk_idx, _ = torch.ops.custom.npu_moe_gating_top_k(
+                logits, k=self.top_k, bias=self.e_score_correction_bias,
+                input_ids=input_ids if self.is_hash else None,
+                tid2eid=self.tid2eid, k_group=1, group_count=1,
+                group_select_mode=1, renorm=0,
+                norm_type=scoring_func_mapping[self.scoring_func],
+                routed_scaling_factor=self.routed_scaling_factor,
+                eps=float(1e-20), out_flag=False,
+            )
+            return topk_idx.to(torch.int32), topk_weight
         elif self.topk_method == "greedy":
             topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         else:
@@ -1188,68 +1173,19 @@ class OpKernel:
 
     @staticmethod
     def hc_pre(hidden_states, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, norm_eps, hc_eps):
-        if _HAS_NPU_HC_PRE:
-            try:
-                y, post, comb = torch.ops.custom.npu_hc_pre(
-                    hidden_states,
-                    hc_fn.float() if hc_fn.dtype != torch.float32 else hc_fn,
-                    hc_scale.float() if hc_scale.dtype != torch.float32 else hc_scale,
-                    hc_base.float() if hc_base.dtype != torch.float32 else hc_base,
-                    hc_mult=hc_mult, hc_sinkhorn_iters=sinkhorn_iters,
-                    norm_eps=norm_eps, hc_eps=hc_eps,
-                )
-                return y, post, comb
-            except RuntimeError:
-                pass
-        return OpKernel._hc_pre_native(hidden_states, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, norm_eps, hc_eps)
-
-    @staticmethod
-    def _hc_pre_native(hidden_states, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, norm_eps, hc_eps):
-        shape = hidden_states.shape
-        x = hidden_states.flatten(2).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-
-        pre, post, comb = OpKernel._hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps)
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
-        y = y.to(hidden_states.dtype)
+        y, post, comb = torch.ops.custom.npu_hc_pre(
+            hidden_states,
+            hc_fn.float() if hc_fn.dtype != torch.float32 else hc_fn,
+            hc_scale.float() if hc_scale.dtype != torch.float32 else hc_scale,
+            hc_base.float() if hc_base.dtype != torch.float32 else hc_base,
+            hc_mult=hc_mult, hc_sinkhorn_iters=sinkhorn_iters,
+            norm_eps=norm_eps, hc_eps=hc_eps,
+        )
         return y, post, comb
 
     @staticmethod
-    def _hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps):
-        pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
-        comb = comb.unflatten(-1, (hc_mult, hc_mult))
-
-        pre = torch.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0)) + hc_eps
-        post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[hc_mult:2 * hc_mult].unsqueeze(0).unsqueeze(0))
-        comb = comb * hc_scale[2] + hc_base[2 * hc_mult:].view(hc_mult, hc_mult).unsqueeze(0).unsqueeze(0)
-
-        comb = comb.softmax(-1) + hc_eps
-        col_sum = comb.sum(-2, keepdim=True)
-        comb = comb / (col_sum + hc_eps)
-        for _ in range(sinkhorn_iters - 1):
-            row_sum = comb.sum(-1, keepdim=True)
-            comb = comb / (row_sum + hc_eps)
-            col_sum = comb.sum(-2, keepdim=True)
-            comb = comb / (col_sum + hc_eps)
-        return pre, post, comb
-
-    @staticmethod
     def hc_post(hidden_states, residual, post, comb):
-        if _HAS_NPU_HC_POST:
-            try:
-                return torch.ops.custom.npu_hc_post(hidden_states, residual, post, comb)
-            except RuntimeError:
-                pass
-        return OpKernel._hc_post_native(hidden_states, residual, post, comb)
-
-    @staticmethod
-    def _hc_post_native(hidden_states, residual, post, comb):
-        y = (
-            post.unsqueeze(-1) * hidden_states.float().unsqueeze(-2)
-            + torch.sum(comb.unsqueeze(-1) * residual.float().unsqueeze(-2), dim=2)
-        )
-        return y.type_as(hidden_states)
+        return torch.ops.custom.npu_hc_post(hidden_states, residual, post, comb)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -1555,7 +1491,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if ck_key not in data:
                     continue
                 weight = data[ck_key]
-                if "experts." in ck_key and ".ffn." in ck_key:
+                if "experts." in ck_key and ".ffn." in ck_key and "shared_experts" not in ck_key:
                     expert_weights[ck_key] = weight
                     continue
                 model_name = name_mapping.get(ck_key)

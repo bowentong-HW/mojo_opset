@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-DEFAULT_LOCAL_PATH="/data08/tbw/mojo_opset_info/Deepseek_v4_int8_w8a8"
+DEFAULT_LOCAL_PATH="/data00/dpskv4-flash-quant"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
