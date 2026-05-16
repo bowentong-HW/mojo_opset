@@ -56,12 +56,10 @@ def init_distributed(ep_size):
 
     if world_size > 1:
         if not dist.is_initialized():
-            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
             dist.init_process_group(
                 backend="hccl",
                 world_size=world_size,
                 rank=global_rank,
-                pg_options=options,
             )
             logger.info(f"HCCL init done: global_rank={global_rank}, world_size={world_size}, local_rank={local_rank}")
     return local_rank, global_rank, world_size
@@ -74,27 +72,17 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1):
         global_rank = 0
 
     is_main = (global_rank == 0)
+    moe_ep_group = getattr(model, 'moe_ep_group', None)
 
-    if is_main:
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            input_ids = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
-            )
-        except (TypeError, NotImplementedError, ValueError):
-            input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
+        )
+    except (TypeError, NotImplementedError, ValueError):
+        input_ids = tokenizer.encode(prompt, return_tensors="pt")
 
-        input_ids = input_ids.to(device)
-        seq_len = torch.tensor([input_ids.shape[1]], dtype=torch.int64, device=device)
-    else:
-        input_ids = torch.zeros(1, 1, dtype=torch.long, device=device)
-        seq_len = torch.tensor([0], dtype=torch.int64, device=device)
-
-    if ep_size > 1 and dist.is_initialized():
-        dist.broadcast(seq_len, src=0)
-        if not is_main:
-            input_ids = torch.zeros(1, seq_len.item(), dtype=torch.long, device=device)
-        dist.broadcast(input_ids, src=0)
+    input_ids = input_ids.to(device)
 
     if is_main:
         print(f"\nPrompt: {prompt}")
@@ -112,7 +100,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1):
     next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
 
     if ep_size > 1 and dist.is_initialized():
-        dist.broadcast(next_token_id, src=0)
+        dist.broadcast(next_token_id, src=0, group=moe_ep_group)
 
     generated_ids = [next_token_id.item()]
     input_ids = next_token_id
@@ -130,7 +118,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1):
         next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
 
         if ep_size > 1 and dist.is_initialized():
-            dist.broadcast(next_token_id, src=0)
+            dist.broadcast(next_token_id, src=0, group=moe_ep_group)
 
         tid = next_token_id.item()
         generated_ids.append(tid)
@@ -172,6 +160,8 @@ def main():
 
     ep_size = args.ep_size
     local_rank, global_rank, world_size = init_distributed(ep_size)
+
+    torch_npu.npu.config.allow_internal_format = True
 
     local_files_only = _resolve_local_files_only(args.model_path)
 
@@ -239,8 +229,7 @@ def main():
     if tokenizer is None:
         raise ValueError("Tokenizer not found")
 
-    npu_device_idx = int(os.getenv("NPU_DEVICE_IDX", "0"))
-    generate(model, tokenizer, args.prompt, args.max_new_tokens, f"npu:{npu_device_idx}", ep_size=ep_size)
+    generate(model, tokenizer, args.prompt, args.max_new_tokens, f"npu:{local_rank}", ep_size=ep_size)
 
     if dist.is_initialized():
         dist.destroy_process_group()
