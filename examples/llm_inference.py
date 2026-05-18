@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import logging
+import sys
 
 import torch
 import torch_npu
@@ -24,6 +25,32 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+GOLDEN_DEEPSEEK_V4_ROOT = os.getenv(
+    "GOLDEN_DEEPSEEK_V4_ROOT",
+    "/data01/tbw/mojo_opset_info/cann-recipes-infer/models/deepseek-v4",
+)
+if os.path.isdir(GOLDEN_DEEPSEEK_V4_ROOT) and GOLDEN_DEEPSEEK_V4_ROOT not in sys.path:
+    sys.path.insert(0, GOLDEN_DEEPSEEK_V4_ROOT)
+
+
+def build_prompt_input_ids(model, tokenizer, prompt):
+    messages = [{"role": "user", "content": prompt}]
+    if model.__class__.__name__ == "DeepseekV4ForCausalLM":
+        from utils.encoding_dsv4 import encode_messages
+
+        prompt_text = encode_messages(messages, thinking_mode="chat")
+        return tokenizer.encode(prompt_text, return_tensors="pt"), prompt_text
+
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
+        )
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except (TypeError, NotImplementedError, ValueError):
+        input_ids = tokenizer.encode(prompt, return_tensors="pt")
+        prompt_text = prompt
+    return input_ids, prompt_text
 
 
 def resolve_model_class(model_path: str):
@@ -74,18 +101,13 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1):
     is_main = (global_rank == 0)
     moe_ep_group = getattr(model, 'moe_ep_group', None)
 
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        input_ids = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
-        )
-    except (TypeError, NotImplementedError, ValueError):
-        input_ids = tokenizer.encode(prompt, return_tensors="pt")
-
+    input_ids, prompt_text = build_prompt_input_ids(model, tokenizer, prompt)
     input_ids = input_ids.to(device)
 
     if is_main:
         print(f"\nPrompt: {prompt}")
+        print(f"Rendered prompt: {repr(prompt_text)}")
+        print(f"Input token IDs: {input_ids.detach().cpu().tolist()}")
         print("-" * 40)
 
     with torch.no_grad():
